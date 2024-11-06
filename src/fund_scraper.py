@@ -1,67 +1,87 @@
-import requests
-from lxml import html
-import re
-from datetime import datetime
 import csv
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 def fetch_fund_data():
-    # 定义需要遍历的网址及其对应的基金名称和代号
     funds = {
         'https://fundf10.eastmoney.com/jjjz_017093.html': ("景顺长城纳斯达克科技", "017093"),
         'https://fundf10.eastmoney.com/jjjz_270042.html': ("广发纳斯达克100", "270042"),
         'https://fundf10.eastmoney.com/jjjz_017641.html': ("摩根标普500", "017641")
     }
 
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    options = webdriver.ChromeOptions()
+    options.add_argument('--headless')
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
-    # 获取今天的日期
-    today_date = datetime.now().strftime("%Y-%m-%d")
+    csv_file = 'fund_data.csv'
+    
+    try:
+        try:
+            existing_data = pd.read_csv(csv_file, dtype={'基金代码': str})
+            existing_data['日期'] = pd.to_datetime(existing_data['日期']).dt.strftime('%Y-%m-%d')
+        except FileNotFoundError:
+            existing_data = pd.DataFrame(columns=['日期', '基金名称', '基金代码', '净值', '日增长率'])
+            print("未找到现有CSV文件，创建新的DataFrame")
 
-    # 准备 CSV 文件
-    csv_file = 'investment\\fund_data.csv'
-    with open(csv_file, mode='a', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        # 写入 CSV 文件的标题行
-        # writer.writerow(['日期', '基金名称', '基金代码', '净值', '日增长率'])
+        new_data = []
 
-        # 遍历每个网址
         for url, (fund_name, fund_code) in funds.items():
-            response = requests.get(url, headers=headers)
-            
-            # 检查请求是否成功
-            if response.status_code != 200:
-                print(f"请求失败，状态码: {response.status_code}")
-                continue  # 如果请求失败，跳过当前网址
+            driver.get(url)
+            wait = WebDriverWait(driver, 10)
+            table = wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'w782')))
+            rows = table.find_elements(By.TAG_NAME, 'tr')
 
-            tree = html.fromstring(response.content)
+            for row in rows[1:]:
+                cols = row.find_elements(By.TAG_NAME, 'td')
+                if len(cols) >= 4:
+                    date = pd.to_datetime(cols[0].text).strftime('%Y-%m-%d')
+                    net_value = cols[1].text
+                    growth_rate = cols[3].text.rstrip('%')
 
-            # 使用XPath提取数据
-            xpath = '//label[contains(text(), "单位净值")]'
-            elements = tree.xpath(xpath)
+                    is_existing = ((existing_data['日期'] == date) & 
+                                   (existing_data['基金代码'] == fund_code)).any()
 
-            if elements:
-                for element in elements:
-                    # 将 LabelElement 转换为字符串
-                    label_string = html.tostring(element, encoding='UTF-8').decode('utf-8')
-                    
-                    # 提取 <b> 标签中的内容
-                    b_element = element.xpath('./b/text()')
-                    if b_element:
-                        b_text = b_element[0].strip()  # 获取 <b> 标签内的文本并去除空白
+                    if not is_existing:
+                        new_data.append([date, fund_name, fund_code, net_value, growth_rate])
 
-                        # 使用正则表达式从 <b> 文本中提取单位净值和增长率
-                        net_value_match = re.search(r'([\d.]+)', b_text)  # 提取单位净值
-                        growth_rate_match = re.search(r'\(\s*([-]?\d+\.?\d*)%\s*\)', b_text)  # 提取日增长率
+        if new_data:
+            new_df = pd.DataFrame(new_data, columns=['日期', '基金名称', '基金代码', '净值', '日增长率'])
+            combined_df = pd.concat([existing_data, new_df], ignore_index=True)
+            combined_df.drop_duplicates(subset=['日期', '基金代码'], keep='first', inplace=True)
+            combined_df.to_csv(csv_file, index=False, encoding='utf-8')
+            print(f"已添加 {len(new_data)} 条新数据到 {csv_file}")
+        else:
+            print("没有新数据需要添加")
 
-                        # 提取单位净值
-                        net_value = float(net_value_match.group(1)) if net_value_match else None
-                        # 提取增长率
-                        growth_rate = growth_rate_match.group(1) + '%' if growth_rate_match else None
-                        
-                        # 写入 CSV 文件
-                        writer.writerow([today_date, fund_name, fund_code, net_value, growth_rate])
-                        print(f"{today_date} {fund_name} {fund_code} 净值: {net_value}, 日增长率: {growth_rate}")
+    finally:
+        driver.quit()
+
+    df = pd.read_csv(csv_file, dtype={'基金代码': str})
+    df['日期'] = pd.to_datetime(df['日期'])
+    df_sorted = df.sort_values(by=['基金代码', '日期'], ascending=[True, False])
+    df_sorted.to_csv(csv_file, index=False)
+    print(f"排序后的CSV文件已保存至: {csv_file}")
+
+    CSVDeduplicator.deduplicate_csv(csv_file, csv_file, ['日期', '基金代码'])
+
+class CSVDeduplicator:
+    @staticmethod
+    def deduplicate_csv(input_file: str, output_file: str, columns: list[str] = None) -> None:
+        try:
+            df = pd.read_csv(input_file, dtype={'基金代码': str})
+            original_rows = len(df)
+            if columns:
+                df.drop_duplicates(subset=columns, keep='first', inplace=True)
             else:
-                print("未找到匹配的元素")
+                df.drop_duplicates(keep='first', inplace=True)
+            deduplicated_rows = len(df)
+            df.to_csv(output_file, index=False, header=True)
+            print(f"去重完成。原始行数: {original_rows}, 去重后行数: {deduplicated_rows}")
+            print(f"删除的重复行数: {original_rows - deduplicated_rows}")
+        except Exception as e:
+            print(f"处理CSV文件时发生错误: {str(e)}")
